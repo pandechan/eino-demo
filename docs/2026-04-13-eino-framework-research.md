@@ -341,7 +341,7 @@ messages, err := template.Format(ctx, map[string]any{
 | **Collect** | `StreamReader` | 普通值 | 收集流式输入 |
 | **Transform** | `StreamReader` | `StreamReader` | 流式输入 + 流式输出 |
 
-### 4.4 流自动处理
+### 4.8 流自动处理
 
 Eino 的一大亮点——开发者无需手动处理流转换，框架自动完成：
 - **拼接**（concatenation）—— 流片段合并

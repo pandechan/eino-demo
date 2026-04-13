@@ -172,7 +172,167 @@ type ChatModel interface {
 - **Checkpoint**：检查点机制，支持 Interrupt/Resume（人工介入）
 - **编译模型**：`graph.Compile()` → `Runnable`，编译后不可修改
 
-### 4.3 四种执行模式
+### 4.3 Graph API 详解
+
+#### 创建 Graph
+
+```go
+// 无状态 Graph
+g := compose.NewGraph[string, string]()
+
+// 有状态 Graph — 通过 WithGenLocalState 注入每次执行的局部状态
+g := compose.NewGraph[string, *schema.Message](
+    compose.WithGenLocalState(func(ctx context.Context) *MyState {
+        return &MyState{}
+    }),
+)
+```
+
+#### 节点添加方法（Add*Node）
+
+Graph 为每种组件提供类型化的节点添加方法，确保编译时类型安全：
+
+```go
+// 组件节点 — 输入输出类型由组件接口决定
+g.AddChatModelNode(key, chatModel, opts...)            // []*Message → *Message
+g.AddChatTemplateNode(key, template, opts...)           // map[string]any → []*Message
+g.AddRetrieverNode(key, retriever, opts...)             // string → []*Document
+g.AddEmbeddingNode(key, embedder, opts...)              // []string → [][]float64
+g.AddIndexerNode(key, indexer, opts...)                 // []*Document → []string
+g.AddLoaderNode(key, loader, opts...)                   // Source → []*Document
+g.AddDocumentTransformerNode(key, transformer, opts...) // []*Document → []*Document
+g.AddToolsNode(key, toolsNode, opts...)                 // []*Message → []*Message
+
+// 自定义逻辑节点
+g.AddLambdaNode(key, lambda, opts...)                   // 任意 I → O 类型转换
+g.AddGraphNode(key, subGraph, opts...)                  // 嵌套子图
+g.AddPassthroughNode(key, opts...)                      // 直通（Pregel 模式用）
+```
+
+#### Lambda — 类型桥接的万能胶水
+
+**Lambda 是 Graph 编排中最重要的工具**，用于在组件之间做类型转换：
+
+```go
+// 同步 Lambda
+compose.InvokableLambda(func(ctx context.Context, docs []*schema.Document) (map[string]any, error) {
+    // 将检索结果转换为模板需要的 map
+    return map[string]any{"context": formatDocs(docs)}, nil
+})
+
+// 流式 Lambda
+compose.StreamableLambda(func(ctx context.Context, in string) (*schema.StreamReader[string], error) {
+    // 返回流式输出
+})
+
+// 完整四合一（Invoke + Stream + Collect + Transform）
+compose.AnyLambda[I, O, TOption](invoke, stream, collect, transform)
+```
+
+#### 边连接与分支
+
+```go
+// 顺序连接
+g.AddEdge(compose.START, "nodeA")
+g.AddEdge("nodeA", "nodeB")
+g.AddEdge("nodeB", compose.END)
+
+// 条件分支 — 根据运行时数据动态路由
+branch := compose.NewGraphBranch(conditionFunc, map[string]bool{
+    "pathA": true,
+    "pathB": true,
+})
+g.AddBranch("nodeA", branch)
+```
+
+#### 编译与执行
+
+```go
+// 编译（编译后不可修改）
+runnable, err := g.Compile(ctx, compose.WithGraphName("MyGraph"))
+
+// 四种执行模式
+result, err := runnable.Invoke(ctx, input)       // 同步
+stream, err := runnable.Stream(ctx, input)        // 流式输出
+result, err := runnable.Collect(ctx, streamIn)    // 流式输入
+stream, err := runnable.Transform(ctx, streamIn)  // 流式输入 + 流式输出
+```
+
+### 4.4 有状态 Graph（State Graph）
+
+State Graph 解决了编排中最常见的问题：**如何在不相邻的节点间传递数据**。
+
+#### 核心 API
+
+```go
+// 1. 创建有状态 Graph
+g := compose.NewGraph[string, *schema.Message](
+    compose.WithGenLocalState(func(ctx context.Context) *MyState {
+        return &MyState{}
+    }),
+)
+
+// 2. 在节点执行前读/写状态
+g.AddLambdaNode("node1", lambda,
+    compose.WithStatePreHandler(func(ctx context.Context, input string, state *MyState) (string, error) {
+        state.Query = input  // 将输入存入状态
+        return input, nil    // 返回（可能修改后的）输入
+    }),
+)
+
+// 3. 在节点执行后读/写状态
+g.AddLambdaNode("node2", lambda,
+    compose.WithStatePostHandler(func(ctx context.Context, output map[string]any, state *MyState) (map[string]any, error) {
+        output["query"] = state.Query  // 从状态读取数据注入输出
+        return output, nil
+    }),
+)
+```
+
+#### 典型场景
+
+State Graph 在 RAG 中尤为关键：Retriever 消费了 query 输入，但下游的 ChatTemplate 也需要 query。通过 State 可以优雅地解决这个问题，无需破坏节点间的类型约束。
+
+### 4.5 Chain API（线性流水线简化）
+
+Chain 是 Graph 的简化封装，适合线性管道场景：
+
+```go
+chain := compose.NewChain[string, *schema.Message]()
+chain.AppendRetriever(myRetriever)          // string → []*Document
+chain.AppendLambda(formatDocsLambda)        // []*Document → map[string]any
+chain.AppendChatTemplate(myTemplate)        // map[string]any → []*Message
+chain.AppendChatModel(myModel)              // []*Message → *Message
+
+runnable, err := chain.Compile(ctx)
+```
+
+支持的 Append 方法：`AppendChatModel`, `AppendChatTemplate`, `AppendRetriever`, `AppendEmbedding`, `AppendIndexer`, `AppendLoader`, `AppendDocumentTransformer`, `AppendLambda`, `AppendGraph`, `AppendBranch`, `AppendParallel`, `AppendPassthrough`
+
+### 4.6 Prompt 模板系统
+
+```go
+// 使用 FString 模板语法（Python 风格 {variable}）
+template := prompt.FromMessages(schema.FString,
+    &schema.Message{Role: schema.System, Content: "基于以下上下文回答:\n{context}"},
+    schema.MessagesPlaceholder("history", true),  // 可选的历史消息占位符
+    &schema.Message{Role: schema.User, Content: "{question}"},
+)
+
+// 渲染
+messages, err := template.Format(ctx, map[string]any{
+    "context":  "...",
+    "question": "...",
+    "history":  []*schema.Message{...},  // 可选
+})
+```
+
+支持三种模板语法：
+- `schema.FString` — Python f-string 风格 `{variable}`
+- `schema.GoTemplate` — Go text/template
+- `schema.Jinja2` — Jinja2 模板 `{{variable}}`
+
+### 4.7 四种执行模式
 
 | 模式 | 输入 | 输出 | 场景 |
 |------|------|------|------|
@@ -391,9 +551,200 @@ graph.AddEdge("tools", "agent")       // 环：tools → agent
 runnable, _ := graph.Compile()
 ```
 
+### 模式 6：RAG Graph 编排（检索增强生成）
+
+```go
+// 定义跨节点共享的状态
+type ragState struct {
+    Query string
+}
+
+g := compose.NewGraph[string, *schema.Message](
+    compose.WithGenLocalState(func(ctx context.Context) *ragState {
+        return &ragState{}
+    }),
+)
+
+// 节点 1: retriever — 检索相关文档
+g.AddLambdaNode("retriever",
+    compose.InvokableLambda(func(ctx context.Context, query string) ([]*schema.Document, error) {
+        return myRetriever.Retrieve(ctx, query)
+    }),
+    // 执行前将 query 存入 state
+    compose.WithStatePreHandler(func(ctx context.Context, query string, state *ragState) (string, error) {
+        state.Query = query
+        return query, nil
+    }),
+)
+
+// 节点 2: formatter — 格式化检索结果为模板变量
+g.AddLambdaNode("formatter",
+    compose.InvokableLambda(func(ctx context.Context, docs []*schema.Document) (map[string]any, error) {
+        var parts []string
+        for i, doc := range docs {
+            parts = append(parts, fmt.Sprintf("[%d] %s", i+1, doc.Content))
+        }
+        return map[string]any{"context": strings.Join(parts, "\n\n")}, nil
+    }),
+    // 执行后从 state 读取 query 注入输出
+    compose.WithStatePostHandler(func(ctx context.Context, out map[string]any, state *ragState) (map[string]any, error) {
+        out["question"] = state.Query
+        return out, nil
+    }),
+)
+
+// 节点 3: template — 渲染 RAG Prompt
+ragTemplate := prompt.FromMessages(schema.FString,
+    &schema.Message{Role: schema.System, Content: "基于以下参考资料回答问题:\n{context}"},
+    &schema.Message{Role: schema.User, Content: "{question}"},
+)
+g.AddChatTemplateNode("template", ragTemplate)
+
+// 节点 4: llm — 生成最终回答
+g.AddChatModelNode("llm", chatModel)
+
+// 连接边
+g.AddEdge(compose.START, "retriever")
+g.AddEdge("retriever", "formatter")
+g.AddEdge("formatter", "template")
+g.AddEdge("template", "llm")
+g.AddEdge("llm", compose.END)
+
+// 编译并执行
+runnable, _ := g.Compile(ctx, compose.WithGraphName("EinoRAG"))
+answer, _ := runnable.Invoke(ctx, "Eino 支持哪些编排模式？")   // 同步
+stream, _ := runnable.Stream(ctx, "Eino 的流式处理怎么设计的？") // 流式
+```
+
 ---
 
-## 九、学习路径
+## 九、RAG 实战：Graph 编排深度解析
+
+### 9.1 RAG 的两条流水线
+
+**索引流水线（离线/预处理）**
+
+```
+Loader → Transformer(分割) → Embedder(向量化) → Indexer(存储)
+```
+
+类型流：`Source → []*Document → []*Document → [][]float64 → []string`
+
+**查询流水线（在线/实时）**
+
+```
+Query → Retriever(检索) → Formatter(格式化) → ChatTemplate(渲染) → ChatModel(生成) → Answer
+```
+
+类型流：`string → []*Document → map[string]any → []*Message → *Message`
+
+### 9.2 Graph 编排 RAG 的架构
+
+```
+┌───────┐    ┌───────────┐    ┌──────────┐    ┌──────────┐    ┌─────┐    ┌─────┐
+│ START │───→│ retriever │───→│ formatter│───→│ template │───→│ llm │───→│ END │
+└───────┘    └───────────┘    └──────────┘    └──────────┘    └─────┘    └─────┘
+   │              ↑ ↓                              ↑
+   │     State: 存 Query                  State: 读 Query
+   └────────── WithGenLocalState 跨节点传递 ─────────┘
+```
+
+**为什么需要 State？**
+
+RAG 的核心挑战在于：Retriever 节点消费了 `query` 作为输入，但下游的 ChatTemplate 也需要 `query`。由于 Graph 的数据是单向流动的（每个节点只接收上游节点的输出），`query` 在经过 Retriever 后就"丢失"了。
+
+State Graph 通过 `WithGenLocalState` + `WithStatePreHandler/PostHandler` 优雅地解决了这个问题：
+1. **Retriever 的 StatePreHandler**：执行前将 `query` 存入 `state.Query`
+2. **Formatter 的 StatePostHandler**：执行后从 `state.Query` 读取并注入到输出 `map` 中
+
+这样既保持了节点间严格的类型约束，又实现了跨节点数据传递。
+
+### 9.3 Lambda 在 RAG 中的关键作用
+
+RAG 流水线中，组件输出类型和下一个组件输入类型通常不匹配：
+
+| 上游输出 | 下游输入 | 需要 Lambda |
+|---------|---------|------------|
+| Retriever → `[]*Document` | ChatTemplate → `map[string]any` | ✅ 文档列表 → 模板变量 |
+| ChatTemplate → `[]*Message` | ChatModel → `[]*Message` | ❌ 类型匹配，直连 |
+
+Lambda 是 Graph 编排中的"万能胶水"，任何类型不匹配的地方都用 `InvokableLambda` 桥接。
+
+### 9.4 Retriever 接口与实现策略
+
+```go
+// Retriever 接口 — 仅一个方法
+type Retriever interface {
+    Retrieve(ctx context.Context, query string, opts ...Option) ([]*schema.Document, error)
+}
+
+// Retriever Options
+retriever.WithTopK(5)                    // 返回 top-K 结果
+retriever.WithScoreThreshold(0.5)        // 分数过滤阈值
+retriever.WithEmbedding(embedder)        // 注入 Embedder
+```
+
+**实现策略**：
+
+| 策略 | 适用场景 | 依赖 |
+|------|---------|------|
+| **自实现内存检索** | Demo/原型/小数据量 | 仅需 Embedding API |
+| **eino-ext 后端** | 生产环境 | Redis/Milvus/Qdrant/ES 等 |
+| **LLM 打分替代** | 无向量库时 | 仅需 ChatModel |
+
+**内存向量检索的实现要点**：
+1. 预处理阶段：调用 Embedding API 将所有文档转为向量
+2. 检索阶段：将 query 转为向量，计算与所有文档向量的余弦相似度
+3. 排序返回 top-K 结果
+
+### 9.5 高级检索模式（flow/retriever/）
+
+Eino 内置了三种增强检索模式：
+
+| 模式 | 说明 | 适用场景 |
+|------|------|---------|
+| **MultiQuery** | 用 LLM 将原始 query 改写为多个变体，分别检索后去重融合 | 提高召回率 |
+| **Parent** | 子文档检索命中后返回父文档（更大上下文） | 长文档场景 |
+| **Router** | 根据 query 特征路由到不同 Retriever | 多知识库场景 |
+
+```go
+// MultiQuery Retriever 示例
+multiRetriever := multiquery.NewRetriever(ctx, &multiquery.Config{
+    RewriteLLM:    chatModel,           // 用于改写 query 的 LLM
+    OrigRetriever: baseRetriever,       // 底层检索器
+    MaxQueriesNum: 5,                   // 最多改写为 5 个变体
+})
+docs, _ := multiRetriever.Retrieve(ctx, "Eino 怎么做流式处理？")
+```
+
+### 9.6 RAG 实战经验总结
+
+| 要点 | 说明 |
+|------|------|
+| **State 传递 Query** | 用 `WithGenLocalState` + `StatePreHandler/PostHandler` 跨节点传递原始问题 |
+| **Lambda 桥接类型** | `[]*Document → map[string]any` 是 RAG 中最常见的 Lambda 用途 |
+| **Embedding 模型选择** | 中文场景推荐使用中文优化的 Embedding 模型，nomic-embed-text 等英文模型对中文语义匹配效果有限 |
+| **Top-K 调优** | top-K 太小可能漏掉相关文档，太大会引入噪音。建议从 3-5 开始调整 |
+| **Graph vs Chain** | 简单线性 RAG 用 Chain 更简洁；需要状态传递、条件分支时用 Graph |
+| **Compile 一次执行多次** | Graph 编译后得到的 Runnable 可重复使用，支持 Invoke 和 Stream 两种模式 |
+
+---
+
+## 十、Flow 增强检索模式
+
+Eino 在 `flow/retriever/` 包下内置了高级检索模式，无需自己用 Graph 拼装：
+
+| 模式 | 包路径 | 原理 |
+|------|--------|------|
+| `multiquery` | `flow/retriever/multiquery` | LLM 将 query 改写为多个变体 → 分别检索 → 去重融合，提升召回率 |
+| `parent` | `flow/retriever/parent` | 按小 chunk 检索命中 → 返回所在的父文档（更大上下文窗口） |
+| `router` | `flow/retriever/router` | 根据 query 特征路由到不同 Retriever（多知识库场景） |
+
+同样，`flow/indexer/parent` 提供了对应的父子文档索引写入能力。
+
+---
+
+## 十一、学习路径
 
 官方提供 10 章渐进式教程（eino-examples/quickstart）：
 
@@ -412,7 +763,7 @@ runnable, _ := graph.Compile()
 
 ---
 
-## 十、核心竞争力总结
+## 十二、核心竞争力总结
 
 | 维度 | 优势 |
 |------|------|
@@ -429,7 +780,7 @@ runnable, _ := graph.Compile()
 
 ---
 
-## 十一、与 LangChain(Go) 的定位差异
+## 十三、与 LangChain(Go) 的定位差异
 
 | 维度 | Eino | LangChain(Go) / LangChainGo |
 |------|------|------|
@@ -444,7 +795,7 @@ runnable, _ := graph.Compile()
 
 ---
 
-## 十二、适用场景建议
+## 十四、适用场景建议
 
 | 场景 | 推荐度 | 说明 |
 |------|--------|------|

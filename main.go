@@ -43,12 +43,17 @@ func main() {
 func printUsage() {
 	fmt.Println("Eino Demo — 基于 Ollama 本地模型")
 	fmt.Println()
-	fmt.Println("用法: go run . <command> [args]")
+	fmt.Println("用法: go run . <command> [问题]")
 	fmt.Println()
 	fmt.Println("命令:")
-	fmt.Println("  chat           基础对话（同步生成）")
-	fmt.Println("  stream         流式输出（打字机效果）")
-	fmt.Println("  agent          工具调用 Agent（ReAct 循环）")
+	fmt.Println("  chat   [问题]   基础对话（同步生成）")
+	fmt.Println("  stream [问题]   流式输出（打字机效果）")
+	fmt.Println("  agent  [问题]   工具调用 Agent（ReAct 循环）")
+	fmt.Println()
+	fmt.Println("示例:")
+	fmt.Println("  go run . chat 什么是微服务架构？")
+	fmt.Println("  go run . stream 用Go写一个快排")
+	fmt.Println("  go run . agent 现在几点了？帮我算下 3.14 * 100")
 }
 
 // =============================================================================
@@ -61,14 +66,13 @@ func runChat(ctx context.Context) {
 
 	chatModel := mustCreateModel(ctx)
 
-	// 构造消息
+	question := getUserQuestion("用一句话解释什么是 Go 语言的 goroutine？")
 	messages := []*schema.Message{
 		schema.SystemMessage("你是一个友好的助手，回答简洁明了。"),
-		schema.UserMessage("用一句话解释什么是 Go 语言的 goroutine？"),
+		schema.UserMessage(question),
 	}
 
-	fmt.Println("📤 发送: 用一句话解释什么是 Go 语言的 goroutine？")
-	fmt.Println()
+	fmt.Printf("📤 发送: %s\n\n", question)
 
 	start := time.Now()
 	resp, err := chatModel.Generate(ctx, messages)
@@ -91,7 +95,7 @@ func runStream(ctx context.Context) {
 
 	chatModel := mustCreateModel(ctx)
 
-	question := "简要介绍 Eino 框架的三个核心特点，每个特点用一句话概括。"
+	question := getUserQuestion("简要介绍 Eino 框架的三个核心特点，每个特点用一句话概括。")
 	messages := []*schema.Message{
 		schema.SystemMessage("你是一个技术专家，回答简洁。"),
 		schema.UserMessage(question),
@@ -150,7 +154,7 @@ func runAgent(ctx context.Context) {
 		os.Exit(1)
 	}
 
-	question := "现在几点了？另外帮我算一下 sqrt(144) + 3.14 * 2 等于多少？"
+	question := getUserQuestion("现在几点了？另外帮我算一下 sqrt(144) + 3.14 * 2 等于多少？")
 	messages := []*schema.Message{
 		schema.SystemMessage("你是一个有用的助手，可以使用工具来回答问题。请用中文回答。"),
 		schema.UserMessage(question),
@@ -286,6 +290,14 @@ func (t *currentTimeTool) InvokableRun(ctx context.Context, argumentsInJSON stri
 // =============================================================================
 // 辅助函数
 // =============================================================================
+
+// getUserQuestion 从命令行参数获取问题，没传则用默认值
+func getUserQuestion(defaultQ string) string {
+	if len(os.Args) > 2 {
+		return strings.Join(os.Args[2:], " ")
+	}
+	return defaultQ
+}
 
 func mustCreateModel(ctx context.Context) model.ToolCallingChatModel {
 	modelName := "qwen2.5:3b"
